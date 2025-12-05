@@ -31,10 +31,12 @@
 
 #include "rdma_common.h"
 
-#define MAX_BUFF_SIZE (256) /* Maximum DOCA buffer size */
-
+#define MAX_BUFF_SIZE (65536) /* Maximum DOCA buffer size */
+#define SIG_SIZE 8
+#define DATA_OFFSET 0
+#define SIGNAL_OFFSET (MAX_BUFF_SIZE)
 DOCA_LOG_REGISTER(RDMA_WRITE_RESPONDER::SAMPLE);
-
+char bufferr[MAX_BUFF_SIZE];
 /*
  * Write the connection details and the mmap details for the requester to read,
  * and read the connection details of the requester
@@ -142,47 +144,100 @@ static doca_error_t rdma_write_responder_export_and_connect(struct rdma_resource
 	return result;
 }
 
-/*
- * Responder wait for requester to finish
- *
- * @resources [in]: RDMA resources
- * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
- */
-static doca_error_t responder_wait_for_requester_finish(struct rdma_resources *resources)
+//helper for receive final signal
+static void final_signal_received_callback(struct doca_rdma_task_receive *task,
+                                           union doca_data task_user_data,
+                                           union doca_data ctx_user_data)
 {
-	doca_error_t result = DOCA_SUCCESS;
-	char buffer[MAX_BUFF_SIZE];
+    doca_error_t result = DOCA_SUCCESS;
+    struct rdma_resources *resources = (struct rdma_resources *)ctx_user_data.ptr;
+    DOCA_LOG_INFO("\n Received final signal from requester. Benchmark complete.\n");
 
-	/* Wait for enter which means that the requester has finished writing */
-	DOCA_LOG_INFO("Wait till the requester has finished writing and press enter");
-	wait_for_enter();
+	/* The RDMA Write target memory (where requester wrote data) */
+    char *rdma_written_data = (char *)resources->mmap_memrange;
 
-	/* Initialize buffer to zeros */
-	memset(buffer, 0, MAX_BUFF_SIZE);
+    /* Print the first bytes written by the requester */
+    char print_buf[65];
+    memcpy(print_buf, rdma_written_data, 64);
+    print_buf[64] = '\0';
 
-	/* Read the data that was written on the mmap */
-	strncpy(buffer, resources->mmap_memrange, MAX_BUFF_SIZE - 1);
+    DOCA_LOG_INFO("First 64 bytes written via RDMA Write: \"%s\"", print_buf);
 
-	/* Check if the buffer is null terminated and of legal size */
-	if (strnlen(buffer, MAX_BUFF_SIZE) == MAX_BUFF_SIZE) {
-		DOCA_LOG_ERR("The message that was written by the requester exceeds buffer size %d", MAX_BUFF_SIZE);
-		result = DOCA_ERROR_INVALID_VALUE;
-		goto length_check_error;
+    /* Print the received message ("done") separately */
+    struct doca_buf *recv_buf = doca_rdma_task_receive_get_dst_buf(task);
+    void *recv_data = NULL;
+    size_t recv_len = 0;
+    doca_buf_get_data(recv_buf, &recv_data);
+
+    DOCA_LOG_INFO("Final signal message: \"%s\"", (char *)recv_data);
+    // Free the task and its buffer
+    doca_task_free(doca_rdma_task_receive_as_task(task));
+	result = doca_buf_dec_refcount(resources->dst_buf, NULL);
+	if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to decrease src_buf count: %s", doca_error_get_descr(result));
 	}
-
-	DOCA_LOG_INFO("Requester has written: \"%s\"", buffer);
-
-length_check_error:
-	if (resources->cfg->use_rdma_cm == true) {
-		result = rdma_cm_disconnect(resources);
-		if (result != DOCA_SUCCESS) {
-			DOCA_LOG_ERR("Failed to disconnect RDMA connection: %s", doca_error_get_descr(result));
-		}
+	resources->num_remaining_tasks--;
+	/* Stop context once all tasks are completed */
+	if (resources->num_remaining_tasks == 0) {
+		if (resources->cfg->use_rdma_cm == true)
+			(void)rdma_cm_disconnect(resources);
+		(void)doca_ctx_stop(resources->rdma_ctx);
 	}
+}
 
-	(void)doca_ctx_stop(resources->rdma_ctx);
 
-	return result;
+static void rdma_receive_error_callback(struct doca_rdma_task_receive *rdma_receive_task,
+					union doca_data task_user_data,
+					union doca_data ctx_user_data)
+{
+	struct rdma_resources *resources = (struct rdma_resources *)ctx_user_data.ptr;
+	struct doca_task *task = doca_rdma_task_receive_as_task(rdma_receive_task);
+	doca_error_t *first_encountered_error = (doca_error_t *)task_user_data.ptr;
+	doca_error_t result;
+
+	/* Update that an error was encountered */
+	result = doca_task_get_status(task);
+	DOCA_ERROR_PROPAGATE(*first_encountered_error, result);
+	DOCA_LOG_ERR("RDMA receive task failed: %s", doca_error_get_descr(result));
+
+	doca_task_free(task);
+	result = doca_buf_dec_refcount(resources->dst_buf, NULL);
+	if (result != DOCA_SUCCESS)
+		DOCA_LOG_ERR("Failed to decrease dst_buf count: %s", doca_error_get_descr(result));
+
+	resources->num_remaining_tasks--;
+	/* Stop context once all tasks are completed */
+	if (resources->num_remaining_tasks == 0) {
+		if (resources->cfg->use_rdma_cm == true)
+			(void)rdma_cm_disconnect(resources);
+		(void)doca_ctx_stop(resources->rdma_ctx);
+	}
+}
+
+//instead of waiting
+static doca_error_t post_final_signal_receive(struct rdma_resources *resources)
+{
+    doca_error_t result = DOCA_SUCCESS;
+    struct doca_rdma_task_receive *recv_task;
+    union doca_data user_data = {0};
+	result = doca_buf_inventory_buf_get_by_addr(resources->buf_inventory,
+                                                resources->mmap,
+                                                resources->mmap_memrange + SIGNAL_OFFSET,
+                                                MAX_BUFF_SIZE,
+                                                &resources->dst_buf);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to get a buffer for the receive task: %s", doca_error_get_descr(result));
+        return result;
+    }
+    result = doca_rdma_task_receive_allocate_init(resources->rdma, resources->dst_buf, user_data, &recv_task);
+    if (result != DOCA_SUCCESS) {
+        DOCA_LOG_ERR("Failed to allocate receive task: %s", doca_error_get_descr(result));
+        return result;
+    }
+
+    DOCA_LOG_INFO("Posted RDMA receive task to wait for requester's completion signal.");
+    resources->num_remaining_tasks++;
+    return doca_task_submit(doca_rdma_task_receive_as_task(recv_task));
 }
 
 /*
@@ -223,7 +278,11 @@ static void rdma_write_responder_state_change_callback(const union doca_data use
 		if (cfg->use_rdma_cm == true)
 			break;
 
-		result = responder_wait_for_requester_finish(resources);
+		result = post_final_signal_receive(resources);
+		if (result != DOCA_SUCCESS) {
+			DOCA_LOG_ERR("Failed to post final signal receive task: %s", doca_error_get_descr(result));
+			(void)doca_ctx_stop(ctx);
+		}
 		break;
 	case DOCA_CTX_STATE_STOPPING:
 		/**
@@ -291,10 +350,34 @@ doca_error_t rdma_write_responder(struct rdma_config *cfg)
 		goto destroy_resources;
 	}
 
+	//configure receive task
+	result = doca_rdma_task_receive_set_conf(resources.rdma,
+                                         final_signal_received_callback,
+                                         rdma_receive_error_callback,
+                                         1);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to set receive task conf: %s", doca_error_get_descr(result));
+		goto destroy_resources;
+	}
+
+	/* Create DOCA buffer inventory */
+	result = doca_buf_inventory_create(INVENTORY_NUM_INITIAL_ELEMENTS, &resources.buf_inventory);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to create DOCA buffer inventory: %s", doca_error_get_descr(result));
+		goto destroy_resources;
+	}
+
+	/* Start DOCA buffer inventory */
+	result = doca_buf_inventory_start(resources.buf_inventory);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to start DOCA buffer inventory: %s", doca_error_get_descr(result));
+		goto destroy_resources;
+	}
+
 	if (cfg->use_rdma_cm == true) {
 		resources.is_requester = false;
 		resources.require_remote_mmap = true;
-		resources.task_fn = responder_wait_for_requester_finish;
+		resources.task_fn = post_final_signal_receive;
 		result = config_rdma_cm_callback_and_negotiation_task(&resources,
 								      /* need_send_mmap_info */ true,
 								      /* need_recv_mmap_info */ false);
