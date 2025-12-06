@@ -31,11 +31,14 @@
 
 #include "rdma_common.h"
 
-#define MAX_BUFF_SIZE (65536) /* Maximum DOCA buffer size */
+#define MAX_BUFF_SIZE (64000000) /* Maximum DOCA buffer size */
 #define SIG_SIZE 8
 #define DATA_OFFSET 0
 #define NUM_TRANSFERS 1000
-#define SIGNAL_OFFSET (MAX_BUFF_SIZE * NUM_TRANSFERS)
+#define PHYSICAL_BUFFER_SIZE 1024 * 1024 * 1024
+#define NUM_CHUNKS_IN_BUFFER (PHYSICAL_BUFFER_SIZE / MAX_BUFF_SIZE)
+
+#define SIGNAL_OFFSET 1024000008
 DOCA_LOG_REGISTER(RDMA_WRITE_RESPONDER::SAMPLE);
 char bufferr[MAX_BUFF_SIZE];
 /*
@@ -145,23 +148,26 @@ static doca_error_t rdma_write_responder_export_and_connect(struct rdma_resource
 	return result;
 }
 
+//helper for receive final signal
 static void final_signal_received_callback(struct doca_rdma_task_receive *task,
                                            union doca_data task_user_data,
                                            union doca_data ctx_user_data)
 {
     doca_error_t result = DOCA_SUCCESS;
+	// char buffer[MAX_BUFF_SIZE+1];
     struct rdma_resources *resources = (struct rdma_resources *)ctx_user_data.ptr;
     DOCA_LOG_INFO("\n Received final signal from requester. Benchmark complete.\n");
 
 	/* The RDMA Write target memory (where requester wrote data) */
-    char *rdma_written_data = (char *)resources->mmap_memrange + 16000;
-
+	
     /* Print the first bytes written by the requester */
     char print_buf[65];
-    memcpy(print_buf, rdma_written_data, 64);
-    print_buf[64] = '\0';
-
-    DOCA_LOG_INFO("Some 64 bytes written via RDMA Write: \"%s\"", print_buf);
+	for(int j=0; j<NUM_CHUNKS_IN_BUFFER;j++){
+		char *rdma_written_data = (char *)resources->mmap_memrange + MAX_BUFF_SIZE * j;
+		memcpy(print_buf, rdma_written_data, 64);
+		print_buf[64] = '\0';
+		DOCA_LOG_INFO("Some 64 bytes written via RDMA Write: \"%s\"", print_buf);
+	}
 
     /* Print the received message ("done") separately */
     struct doca_buf *recv_buf = doca_rdma_task_receive_get_dst_buf(task);
@@ -172,7 +178,7 @@ static void final_signal_received_callback(struct doca_rdma_task_receive *task,
     DOCA_LOG_INFO("Final signal message: \"%s\"", (char *)recv_data);
     // Free the task and its buffer
     doca_task_free(doca_rdma_task_receive_as_task(task));
-	result = doca_buf_dec_refcount(resources->dst_buf, NULL);
+	result = doca_buf_dec_refcount(recv_buf, NULL);
 	if (result != DOCA_SUCCESS) {
         DOCA_LOG_ERR("Failed to decrease src_buf count: %s", doca_error_get_descr(result));
 	}
@@ -200,8 +206,10 @@ static void rdma_receive_error_callback(struct doca_rdma_task_receive *rdma_rece
 	DOCA_ERROR_PROPAGATE(*first_encountered_error, result);
 	DOCA_LOG_ERR("RDMA receive task failed: %s", doca_error_get_descr(result));
 
+
+	struct doca_buf *dst_buf = doca_rdma_task_receive_get_dst_buf(rdma_receive_task);
 	doca_task_free(task);
-	result = doca_buf_dec_refcount(resources->dst_buf, NULL);
+	result = doca_buf_dec_refcount(dst_buf, NULL);
 	if (result != DOCA_SUCCESS)
 		DOCA_LOG_ERR("Failed to decrease dst_buf count: %s", doca_error_get_descr(result));
 
@@ -213,7 +221,6 @@ static void rdma_receive_error_callback(struct doca_rdma_task_receive *rdma_rece
 		(void)doca_ctx_stop(resources->rdma_ctx);
 	}
 }
-
 
 //instead of waiting
 static doca_error_t post_final_signal_receive(struct rdma_resources *resources)
@@ -242,7 +249,6 @@ static doca_error_t post_final_signal_receive(struct rdma_resources *resources)
     // Submit the task
     return doca_task_submit(doca_rdma_task_receive_as_task(recv_task));
 }
-
 /*
  * RDMA write responder state change callback
  * This function represents the state machine for this RDMA program

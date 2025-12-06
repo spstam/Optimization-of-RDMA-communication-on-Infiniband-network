@@ -32,12 +32,14 @@
 #include "rdma_common.h"
 
 DOCA_LOG_REGISTER(RDMA_WRITE_REQUESTER::SAMPLE);
-#define MAX_BUFF_SIZE 65536
+#define MAX_BUFF_SIZE 64000000
 #define NUM_TRANSFERS 1000
-#define PIPELINE_DEPTH 128
+#define PHYSICAL_BUFFER_SIZE 1024 * 1024 * 1024
+#define NUM_CHUNKS_IN_BUFFER (PHYSICAL_BUFFER_SIZE / MAX_BUFF_SIZE)
+#define PIPELINE_DEPTH 8
 #define SIG_SIZE 8
 #define DATA_OFFSET 0
-#define SIGNAL_OFFSET (MAX_BUFF_SIZE)
+#define SIGNAL_OFFSET 1024000008
 static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *resources);
 /*
  * Write the connection details for the responder to read,
@@ -66,12 +68,22 @@ static doca_error_t cm_requester_setup_and_submit(struct rdma_resources *resourc
 		DOCA_LOG_ERR("Failed to create mmap from export: %s", doca_error_get_descr(result));
 		return result;
 	}
+
+	result = doca_mmap_get_memrange(resources->remote_mmap, (void **)&resources->remote_mmap_range, &resources->remote_mmap_range_len);
+	if (result != DOCA_SUCCESS) {
+		DOCA_LOG_ERR("Failed to get DOCA memory map range: %s", doca_error_get_descr(result));
+		return result;
+	}
+
+	for (int j=0;j<NUM_CHUNKS_IN_BUFFER;j++){
+		memset(resources->mmap_memrange + MAX_BUFF_SIZE * j, 'A' + j, MAX_BUFF_SIZE);
+	}
 	DOCA_LOG_INFO("\nStarting benchmark: %d transfers\n", NUM_TRANSFERS);
     clock_gettime(CLOCK_MONOTONIC, &resources->start_time);
 
     resources->transfers_left = NUM_TRANSFERS; 
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < PIPELINE_DEPTH; i++) {
         if (resources->transfers_left == 0) break;
 
         result = rdma_write_prepare_and_submit_task(resources);
@@ -149,9 +161,6 @@ static void rdma_write_completed_callback(struct doca_rdma_task_write *rdma_writ
 	const struct doca_buf *src_buf;
 	struct doca_buf *dst_buf;
 
-	DOCA_LOG_INFO("RDMA write task was done Successfully");
-	DOCA_LOG_INFO("Written to responder \"%s\"", resources->cfg->write_string);
-
 	src_buf = doca_rdma_task_write_get_src_buf(rdma_write_task);
 	dst_buf = doca_rdma_task_write_get_dst_buf(rdma_write_task);
 
@@ -178,32 +187,9 @@ static void rdma_write_completed_callback(struct doca_rdma_task_write *rdma_writ
     if (resources->transfers_left > 0){
 		result = rdma_write_prepare_and_submit_task(resources);
 		if (result != DOCA_SUCCESS){
-			DOCA_LOG_ERR("rdma_send_prepare_and_submit_task() failed: %s", doca_error_get_descr(result));
-			DOCA_LOG_INFO("All write tasks completed. Sending final signal to responder.");
-			struct doca_rdma_task_send *send_task;
-			struct doca_buf *signal_buf;
-			void *buf_data;
-			const char *signal_msg = "done";
-			result = doca_buf_inventory_buf_get_by_data(resources->buf_inventory, resources->mmap,
-														resources->mmap_memrange+SIGNAL_OFFSET, strlen(signal_msg) + 1,
-														&signal_buf);
-			if (result != DOCA_SUCCESS) {
-				DOCA_LOG_ERR("Failed to get buffer for signal task: %s", doca_error_get_descr(result));
-				(void)doca_ctx_stop(resources->rdma_ctx);
-				return;
-			}
-			doca_buf_get_data(signal_buf, &buf_data);
-        	strcpy(buf_data, signal_msg);	
-			// const char *signal_msg = "done";
-			result = doca_rdma_task_send_allocate_init(resources->rdma, resources->connections[0],
-                                                   signal_buf, 
-                                                   (union doca_data){0}, &send_task);
-			if (result == DOCA_SUCCESS) {
-				doca_task_submit(doca_rdma_task_send_as_task(send_task));
-			} else {
-				DOCA_LOG_ERR("Failed to allocate signal task: %s", doca_error_get_descr(result));
-				doca_buf_dec_refcount(signal_buf, NULL); 
-			}
+			DOCA_LOG_ERR("rdma_send_prepare_and_submit_task() failed: %s", doca_error_get_descr(result));	
+			(void)doca_ctx_stop(resources->rdma_ctx);
+			return;
         }
     }else if(resources->num_remaining_tasks==0){
         //print benchmark results
@@ -224,6 +210,7 @@ static void rdma_write_completed_callback(struct doca_rdma_task_write *rdma_writ
 		struct doca_buf *signal_buf;
 		void *buf_data;
 		const char *signal_msg = "done";
+		// 1. Get a buffer from the inventory for the signal
 		result = doca_buf_inventory_buf_get_by_data(resources->buf_inventory, resources->mmap,
 													resources->mmap_memrange+SIGNAL_OFFSET, strlen(signal_msg) + 1,
 													&signal_buf);
@@ -388,26 +375,16 @@ static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *re
 {
 	struct doca_rdma_task_write *rdma_write_task = NULL;
 	union doca_data task_user_data = {0};
-	char *remote_mmap_range;
-	size_t remote_mmap_range_len;
 	void *src_buf_data;
 
 	doca_error_t result, tmp_result;
-	
 
-	/* Get the remote mmap memory range */
-	result = doca_mmap_get_memrange(resources->remote_mmap, (void **)&remote_mmap_range, &remote_mmap_range_len);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get DOCA memory map range: %s", doca_error_get_descr(result));
-		return result;
-	}
-
-
+	long long int offset = MAX_BUFF_SIZE * ((NUM_TRANSFERS - resources->transfers_left)%NUM_CHUNKS_IN_BUFFER);
 	
 	/* Add src buffer to DOCA buffer inventory from the remote mmap */
 	result = doca_buf_inventory_buf_get_by_data(resources->buf_inventory,
 						    resources->mmap,
-						    resources->mmap_memrange + MAX_BUFF_SIZE * (NUM_TRANSFERS - resources->transfers_left),
+						    resources->mmap_memrange + offset,
 						    MAX_BUFF_SIZE,
 						    &resources->src_buf);
 	if (result != DOCA_SUCCESS) {
@@ -416,18 +393,10 @@ static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *re
 		return result;
 	}
 
-	/* Set data of src buffer to be the string we want to write */
-	result = doca_buf_get_data(resources->src_buf, &src_buf_data);
-	if (result != DOCA_SUCCESS) {
-		DOCA_LOG_ERR("Failed to get source buffer data: %s", doca_error_get_descr(result));
-		goto destroy_src_buf;
-	}
-	// strncpy(src_buf_data, resources->cfg->write_string, write_string_len);
-	memset(src_buf_data, 'S', MAX_BUFF_SIZE);
 	/* Add dst buffer to DOCA buffer inventory */
 	result = doca_buf_inventory_buf_get_by_addr(resources->buf_inventory,
 						    resources->remote_mmap,
-						    remote_mmap_range + MAX_BUFF_SIZE * (NUM_TRANSFERS - resources->transfers_left),
+						    resources->remote_mmap_range + offset,
 						    MAX_BUFF_SIZE,
 						    &resources->dst_buf);
 	if (result != DOCA_SUCCESS) {
@@ -451,7 +420,7 @@ static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *re
 	}
 
 	/* Submit RDMA write task */
-	DOCA_LOG_INFO("Submitting RDMA write task that writes SSS... to the responder");
+	//DOCA_LOG_INFO("Submitting RDMA write task that writes SSS... to the responder");
 	resources->num_remaining_tasks++;
 	result = doca_task_submit(doca_rdma_task_write_as_task(rdma_write_task));
 	if (result != DOCA_SUCCESS) {
@@ -513,16 +482,6 @@ static void rdma_write_requester_state_change_callback(const union doca_data use
 		} else
 			DOCA_LOG_INFO("RDMA context finished initialization");
 			
-			// result = doca_mmap_create_from_export(NULL,
-			// 	resources->remote_mmap_descriptor,
-			// 	resources->remote_mmap_descriptor_size,
-			// 	resources->doca_device,
-			// 	&(resources->remote_mmap));
-			// 	if (result != DOCA_SUCCESS) {
-			// 		DOCA_LOG_ERR("Failed to create mmap from export: %s", doca_error_get_descr(result));
-			// 		(void)doca_ctx_stop(ctx);
-			// 		return;
-			// 	}
 		if (cfg->use_rdma_cm == true)
 			break;
 		
