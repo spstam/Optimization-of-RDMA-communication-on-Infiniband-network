@@ -31,15 +31,15 @@
 #include "rdma_common.h"
 
 DOCA_LOG_REGISTER(RDMA_WRITE_REQUESTER::SAMPLE);
-#define MAX_BUFF_SIZE (65536)
+#define MAX_BUFF_SIZE (8192)
 
-#define NUM_TRANSFERS 1000000
-#define PHYSICAL_BUFFER_SIZE (1024LL * 1024 * 1024)
+#define NUM_TRANSFERS 50000000
+#define PHYSICAL_BUFFER_SIZE (1024 * 1024)
 #define NUM_CHUNKS_IN_BUFFER (PHYSICAL_BUFFER_SIZE / MAX_BUFF_SIZE)
 #define PIPELINE_DEPTH 128
 #define SIG_SIZE 8
 #define DATA_OFFSET 0
-#define SIGNAL_OFFSET 1024000008
+#define SIGNAL_OFFSET 0
 static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *resources);
 /*
  * Write the connection details for the responder to read,
@@ -363,16 +363,16 @@ static void final_signal_sent_callback(struct doca_rdma_task_send *task,
  * @resources [in]: RDMA resources
  * @return: DOCA_SUCCESS on success and DOCA_ERROR otherwise
  */
-static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *resources)
+static doca_error_t rdma_write_prepare_and_submit_task(struct rdma_resources *restrict resources)
 {
 	doca_error_t result;
 
 	int data_idx = (NUM_TRANSFERS - resources->transfers_left);
 
-	long long int offset = MAX_BUFF_SIZE * (data_idx % NUM_CHUNKS_IN_BUFFER);
+	long long int offset = MAX_BUFF_SIZE * (data_idx & (NUM_CHUNKS_IN_BUFFER-1));
 	
 
-	int task_idx = data_idx % PIPELINE_DEPTH;
+	int task_idx = data_idx & (PIPELINE_DEPTH-1);
     doca_buf_set_data(resources->local_bufs[task_idx], resources->mmap_memrange + offset, MAX_BUFF_SIZE);
 
 	doca_buf_dec_refcount(resources->remote_bufs[task_idx], NULL);
